@@ -1,0 +1,97 @@
+name: fingerprint-release
+
+# Builds sureforge_gix on native runners for six targets and publishes the
+# modules as release assets. Parity against sureforge_hook stays in the
+# private parent; this job only checks that the built module imports.
+# runtime/sureforge_gix.lock in the parent is updated afterwards with the
+# sha256 values the release notes list.
+
+on:
+  push:
+    tags: ["fp-v*"]
+  # Builds and tests all six targets from any branch; only an fp-v* tag publishes.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: "2014", ext: so, test: true }
+          - { platform: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2014", ext: so, test: true }
+          - { platform: macos-arm64, os: macos-14, target: aarch64-apple-darwin, manylinux: "", ext: so, test: true }
+          - { platform: macos-x86_64, os: macos-15-intel, target: x86_64-apple-darwin, manylinux: "", ext: so, test: true }
+          - { platform: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, manylinux: "", ext: pyd, test: true }
+          # Cross-built on the x64 runner, which cannot load it: built, not tested.
+          - { platform: windows-arm64, os: windows-latest, target: aarch64-pc-windows-msvc, manylinux: "", ext: pyd, test: false }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'off' }}
+          args: --release --out dist
+      - name: Extract the module
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import glob, pathlib, zipfile
+          wheel, = glob.glob("dist/*.whl")
+          ext = "${{ matrix.ext }}"
+          with zipfile.ZipFile(wheel) as archive:
+              name, = [n for n in archive.namelist() if n.endswith("." + ext)]
+              data = archive.read(name)
+          installed = "sureforge_gix.abi3.so" if ext == "so" else "sureforge_gix.pyd"
+          pathlib.Path("module").mkdir()
+          pathlib.Path("module", installed).write_bytes(data)
+          pathlib.Path("upload").mkdir()
+          pathlib.Path("upload", "sureforge_gix-${{ matrix.platform }}." + ext).write_bytes(data)
+          print(name, len(data), "bytes")
+          EOF
+      - name: Import check
+        if: matrix.test
+        shell: bash
+        run: |
+          python -c "import sys; sys.path.insert(0, 'module'); import sureforge_gix; print('ENGINE_API', sureforge_gix.ENGINE_API)"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sureforge_gix-${{ matrix.platform }}
+          path: upload/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/fp-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd assets
+          ls -la
+          test "$(ls | wc -l)" -eq 6
+          {
+            echo "sureforge_gix modules for runtime/sureforge_gix.lock (ENGINE_API 2)."
+            echo
+            echo '```'
+            sha256sum -- *
+            echo '```'
+          } > ../notes.md
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file ../notes.md -- *
